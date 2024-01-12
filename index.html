@@ -254,8 +254,6 @@
                 }
                 // END TODO: Consolidate between layers
 
-                const metersPerPixel = getMetersPerPixel(lat, map.getZoom());
-                gl.uniform1f(this.uMetersPerPixel, metersPerPixel);
 
                 gl.uniform2fv(this.uDimensions, new Float32Array([tilesWidth * tileSize, tilesHeight * tileSize]));
                 for (const coord of coords) {
@@ -265,12 +263,18 @@
                     if (!bucket) continue;
                     const { x, y, z } = bucket.canonical;
 
+                    if (z !== maxZoom) {
+                        continue;
+                    }
+
                     const minTex = [(x - tileDimensions.xStart) / tilesWidth, (y - tileDimensions.yStart) / tilesHeight]
                     const maxTex = [(x - tileDimensions.xStart + 1) / tilesWidth, (y - tileDimensions.yStart + 1) / tilesHeight]
                     gl.uniform2fv(this.uMinTex, new Float32Array(minTex));
                     gl.uniform2fv(this.uMaxTex, new Float32Array(maxTex));
 
                     const [heightBuffer, baseBuffer] = bucket.programConfigurations.programConfigurations['3d-buildings']._buffers;
+                    const metersPerPixel = getMetersPerPixel(lat, z);
+                    gl.uniform1f(this.uMetersPerPixel, metersPerPixel);
                     gl.uniformMatrix4fv(this.uMatrix, false, coord.projMatrix);
                     for (const segment of bucket.segments.get()) {
                         const numPrevAttrib = context.currentNumAttributes || 0;
