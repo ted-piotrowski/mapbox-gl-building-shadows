@@ -1,6 +1,8 @@
 # mapbox-gl-building-shadows
 Experiments with building shadows
 
+![Mapbox GL Building Shadows demo](/screen.png)](https://ted-piotrowski.github.io/mapbox-gl-building-shadows/index.html)
+
 ## Motivation
 
 Mapbox GL JS version 3 added building shadows to Mapbox maps. The implementation has a few short-comings:
