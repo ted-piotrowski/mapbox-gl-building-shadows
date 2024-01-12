@@ -23,6 +23,10 @@ Use a heightmap + ray-tracing technique to generate realistic building shadows. 
 - Shadow acne (precision issues)
 - Shadows near roofs are incorrect
 
+## Acknowledgements
+
+Volodymyr Agafonkin (@mourner) for the initial shadows demo that laid the groundwork for this along with all his contributions to the mapping ecosystem.
+
 ## Related
 
 - https://github.com/mapbox/mapbox-gl-js/issues/7976
