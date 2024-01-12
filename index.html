@@ -1,0 +1,631 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="utf-8">
+    <title>Mapbox Raytraced Shadows</title>
+    <meta name="viewport" content="initial-scale=1,maximum-scale=1,user-scalable=no">
+    <link href="https://api.mapbox.com/mapbox-gl-js/v2.12.0/mapbox-gl.css" rel="stylesheet">
+    <script src="https://api.mapbox.com/mapbox-gl-js/v2.12.0/mapbox-gl.js"></script>
+    <script src="https://www.unpkg.com/earcut@2.2.4/dist/earcut.min.js"></script>
+    <script src='https://unpkg.com/suncalc@1.9.0/suncalc.js'></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+        }
+
+        #map {
+            position: absolute;
+            top: 0;
+            bottom: 0;
+            width: 100%;
+        }
+
+        #time {
+            position: absolute;
+            width: 90%;
+            top: 10px;
+            left: 10px;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="map"></div>
+    <input id='time' type='range' min="0" max="86400" />
+
+    <script>
+        mapboxgl.accessToken = 'pk.eyJ1IjoidHBwaW90cm93c2tpIiwiYSI6ImNrbGtjcXM4aDBxOW8yb2x5YnBxNHJ0d2IifQ.RuNb9H2ekmbEoG2_nqbjiA';
+        const map = new mapboxgl.Map({
+            // Choose from Mapbox's core styles, or make your own style with Mapbox Studio
+            style: 'mapbox://styles/mapbox/light-v11',
+            center: [-73.980834, 40.757206],
+            zoom: 16,
+            container: 'map',
+            antialias: true,
+            hash: true,
+        });
+
+        var date = new Date("2023-06-21");
+        var time = date.getHours() * 60 * 60 + date.getMinutes() * 60 + date.getSeconds();
+        var timeInput = document.getElementById('time');
+        const { lng, lat } = map.getCenter();
+        var pos = SunCalc.getPosition(date, lat, lng);
+        timeInput.value = time;
+        timeInput.oninput = () => {
+            time = +timeInput.value;
+            date.setHours(Math.floor(time / 60 / 60));
+            date.setMinutes(Math.floor(time / 60) % 60);
+            date.setSeconds(time % 60);
+
+            const { lng, lat } = map.getCenter();
+            pos = SunCalc.getPosition(date, lat, lng);
+
+            map.setLight({
+                anchor: 'map',
+                position: [1.5, 180 + pos.azimuth * 180 / Math.PI, 90 - pos.altitude * 180 / Math.PI],
+                'position-transition': { duration: 0 },
+                color: '#eee'
+            }, { duration: 0 });
+            map.triggerRepaint();
+        };
+        let normalizedBuildings = [];
+        let refreshHeightmap = false;
+        let maxHeight = 0;
+        const heightScaler = 40;
+        const TILE_SIZE = 1024;
+
+        class BuildingShadows {
+            constructor() {
+                this.id = 'building-shadows';
+                this.type = 'custom';
+                this.renderingMode = '3d';
+                // this.opacity = 0.5;
+            }
+            onAdd(map, gl) {
+                this.map = map;
+                const vertexSource = `
+                    uniform mat4 u_matrix;
+                    attribute vec4 a_pos_normal_ed;
+                    attribute lowp vec2 a_base;
+                    attribute lowp vec2 a_height;
+                    varying vec4 v_pos;
+                    void main() {
+                        float base = max(0.0, a_base.x);
+                        float height = max(0.0, a_height.x);
+                        vec4 pos_nx = floor(a_pos_normal_ed * 0.5);
+                        vec4 top_up_ny_start = a_pos_normal_ed - 2.0 * pos_nx;
+                        vec3 top_up_ny = top_up_ny_start.xyz;
+                        float t = top_up_ny.x;
+                        vec4 pos = vec4(pos_nx.xy, t > 0.0 ? height : base, 1);
+                        v_pos = pos;
+                        gl_Position = u_matrix * pos;
+                    }
+                `;
+                const fragmentSource = `
+                precision mediump float;
+                varying vec4 v_pos;
+                uniform float u_meters_per_pixel;
+                uniform sampler2D height_map;
+                uniform vec2 u_min_tex;
+                uniform vec2 u_max_tex;
+                uniform vec2 u_dimensions;
+                uniform float u_azimuth;
+                uniform float u_altitude;
+                uniform float u_max_height;
+
+                const int LOOP_MAX = 1000;
+                void main() {
+                    float user_x = u_min_tex.x + (u_max_tex.x - u_min_tex.x) * (v_pos.x / 8192.0);
+                    float user_y = u_min_tex.y + (u_max_tex.y-u_min_tex.y) * (v_pos.y / 8192.0);
+
+                    // START DEBUG HELP
+                    // vec4 textureColor1 = texture2D(height_map, vec2(user_x, user_y));
+                    // gl_FragColor = vec4(textureColor1.rgb, 0.4);
+                    // return;
+
+                    // vec4 textureColor = texture2D(height_map, vec2(v_pos.x / 8192.0, v_pos.y / 8192.0));
+                    // gl_FragColor = textureColor;
+                    // // gl_FragColor = vec4(v_pos.x / 8192.0, textureColor.r, v_pos.y / 8192.0, 0.4);
+                    // return;
+                    // END DEBUG HELP
+
+                    float user_z = v_pos.z;
+
+                    float user_step = 5.0;
+                    float user_width = u_dimensions.x;
+                    float user_height = u_dimensions.y;
+                    float user_lit = 1.0;
+                    float shadow_bias = 2.0;
+                    float height_scaler = 40.0;
+                    float user_dx = ((-sin(u_azimuth) * cos(u_altitude)) * user_step) / user_width;
+                    float user_dy = ((cos(u_azimuth) * cos(u_altitude)) * user_step) / user_height;
+                    float user_dz = ((sin(u_altitude) * u_meters_per_pixel) * user_step);
+                    user_x += user_dx;
+                    user_y += user_dy;
+                    user_z += user_dz;
+
+                    float xIter = ceil(user_dx < 0.0 ? abs(user_x / user_dx) : (1.0 - user_x) / user_dx);
+                    float yIter = ceil(user_dy < 0.0 ? abs(user_y / user_dy) : (1.0 - user_y) / user_dy);
+                    float zIter = ceil(user_dz < 0.0 ? float(LOOP_MAX) : (u_max_height - user_z) / user_dz);
+                    int iter = int(min(xIter, min(yIter, zIter)));
+
+                    float cur_height;
+                    for (int safeI = 0; safeI < LOOP_MAX; safeI++) {
+                        if (safeI > iter) {
+                            break;
+                        }
+                        vec4 textureColor = texture2D(height_map, vec2(user_x, user_y));
+                        cur_height = (255.0 * 255.0 * textureColor.r + 255.0 * textureColor.g) / height_scaler;
+                        if (cur_height - user_z > shadow_bias) {
+                            user_lit = 0.0;
+                            iter = 0;
+                            break;
+                        }
+                        user_x += user_dx;
+                        user_y += user_dy;
+                        user_z += user_dz;
+                    }
+
+                    if (user_lit == 1.0) {
+                        gl_FragColor = vec4(0.3,0.3,0.3,0.5);
+                    } else {
+                        gl_FragColor = vec4(.3,0.3,0.3,.75);
+                    }
+                }
+                `;
+                const vertexShader = gl.createShader(gl.VERTEX_SHADER);
+                gl.shaderSource(vertexShader, vertexSource);
+                gl.compileShader(vertexShader);
+                const fragmentShader = gl.createShader(gl.FRAGMENT_SHADER);
+                gl.shaderSource(fragmentShader, fragmentSource);
+                gl.compileShader(fragmentShader);
+                this.program = gl.createProgram();
+                gl.attachShader(this.program, vertexShader);
+                gl.attachShader(this.program, fragmentShader);
+                gl.linkProgram(this.program);
+                gl.validateProgram(this.program);
+
+                // vertex uniforms
+                this.uMatrix = gl.getUniformLocation(this.program, "u_matrix");
+                this.aPosNormalEd = gl.getAttribLocation(this.program, "a_pos_normal_ed");
+                this.aBase = gl.getAttribLocation(this.program, "a_base");
+                this.aHeight = gl.getAttribLocation(this.program, "a_height");
+
+                // fragment uniforms
+                this.uMinTex = gl.getUniformLocation(this.program, "u_min_tex");
+                this.uMaxTex = gl.getUniformLocation(this.program, "u_max_tex");
+                this.uDimensions = gl.getUniformLocation(this.program, "u_dimensions");
+                this.uMetersPerPixel = gl.getUniformLocation(this.program, "u_meters_per_pixel");
+                this.uAltitude = gl.getUniformLocation(this.program, "u_altitude");
+                this.uAzimuth = gl.getUniformLocation(this.program, "u_azimuth");
+                this.uMaxHeight = gl.getUniformLocation(this.program, "u_max_height");
+
+                const quadMax = 8192 * 2;
+                this.quadBuffer = gl.createBuffer();
+                gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuffer);
+                gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+                    0, 0, 0, quadMax,
+                    0, quadMax, 0, quadMax,
+                    quadMax, 0, 0, quadMax,
+                    quadMax, quadMax, 0, quadMax,
+                ]), gl.STATIC_DRAW)
+
+            }
+            render(gl, matrix) {
+                console.log('render shading')
+                gl.useProgram(this.program);
+                const source = this.map.style._sourceCaches['other:composite'];
+                const coords = source.getVisibleCoordinates().reverse();
+                const buildingsLayer = map.getLayer('3d-buildings');
+                const context = this.map.painter.context;
+
+                gl.uniform1f(this.uAzimuth, pos.azimuth);
+                gl.uniform1f(this.uAltitude, pos.altitude);
+                gl.uniform1f(this.uMaxHeight, maxHeight);
+
+
+                // TODO: Consolidate between layers
+                let maxZoom = 0;
+                for (const coord of coords) {
+                    const { z } = source.getTile(coord).tileID.canonical;
+                    maxZoom = Math.max(maxZoom, z);
+                }
+
+                // find all tiles that are loaded
+                const tileDimensions = { xStart: Number.MAX_SAFE_INTEGER, yStart: Number.MAX_SAFE_INTEGER, xEnd: 0, yEnd: 0 };
+                let tileSize = 0;
+                let tilesWidth, tilesHeight;
+                for (const coord of coords) {
+                    const tile = source.getTile(coord);
+                    const { x, y, z } = tile.tileID.canonical;
+                    if (z !== maxZoom) {
+                        continue;
+                    }
+                    tileDimensions.xStart = Math.min(x, tileDimensions.xStart);
+                    tileDimensions.yStart = Math.min(y, tileDimensions.yStart);
+                    tileDimensions.xEnd = Math.max(x, tileDimensions.xEnd);
+                    tileDimensions.yEnd = Math.max(y, tileDimensions.yEnd);
+                    tileSize = TILE_SIZE; // tile.tileSize;
+                    const { xEnd, xStart, yEnd, yStart } = tileDimensions;
+                    tilesWidth = xEnd - xStart + 1;
+                    tilesHeight = yEnd - yStart + 1;
+                }
+                // END TODO: Consolidate between layers
+
+                const metersPerPixel = getMetersPerPixel(lat, map.getZoom());
+                gl.uniform1f(this.uMetersPerPixel, metersPerPixel);
+
+                gl.uniform2fv(this.uDimensions, new Float32Array([tilesWidth * tileSize, tilesHeight * tileSize]));
+                for (const coord of coords) {
+                    const tile = source.getTile(coord);
+
+                    const bucket = tile.getBucket(buildingsLayer);
+                    if (!bucket) continue;
+                    const { x, y, z } = bucket.canonical;
+
+                    const minTex = [(x - tileDimensions.xStart) / tilesWidth, (y - tileDimensions.yStart) / tilesHeight]
+                    const maxTex = [(x - tileDimensions.xStart + 1) / tilesWidth, (y - tileDimensions.yStart + 1) / tilesHeight]
+                    gl.uniform2fv(this.uMinTex, new Float32Array(minTex));
+                    gl.uniform2fv(this.uMaxTex, new Float32Array(maxTex));
+
+                    const [heightBuffer, baseBuffer] = bucket.programConfigurations.programConfigurations['3d-buildings']._buffers;
+                    gl.uniformMatrix4fv(this.uMatrix, false, coord.projMatrix);
+                    for (const segment of bucket.segments.get()) {
+                        const numPrevAttrib = context.currentNumAttributes || 0;
+                        const numNextAttrib = 2;
+                        for (let i = numNextAttrib; i < numPrevAttrib; i++) gl.disableVertexAttribArray(i);
+                        const vertexOffset = segment.vertexOffset || 0;
+                        gl.enableVertexAttribArray(this.aPosNormalEd);
+                        gl.enableVertexAttribArray(this.aHeight);
+                        gl.enableVertexAttribArray(this.aBase);
+                        bucket.layoutVertexBuffer.bind();
+                        gl.vertexAttribPointer(this.aPosNormalEd, 4, gl.SHORT, false, 8, 8 * vertexOffset);
+                        heightBuffer.bind();
+                        gl.vertexAttribPointer(this.aHeight, 1, gl.FLOAT, false, 4, 4 * vertexOffset);
+                        baseBuffer.bind();
+                        gl.vertexAttribPointer(this.aBase, 1, gl.FLOAT, false, 4, 4 * vertexOffset);
+                        bucket.indexBuffer.bind();
+                        context.currentNumAttributes = numNextAttrib;
+
+                        gl.enable(gl.BLEND);
+                        gl.drawElements(gl.TRIANGLES, segment.primitiveLength * 3, gl.UNSIGNED_SHORT, segment.primitiveOffset * 3 * 2);
+
+                        // draw ground level quad
+                        gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuffer);
+                        gl.enableVertexAttribArray(this.aPosNormalEd);
+                        gl.vertexAttribPointer(this.aPosNormalEd, 4, gl.FLOAT, false, 0, 0);
+                        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+                    }
+                }
+            }
+        }
+
+        class BuildingHeightMap {
+            constructor() {
+                this.id = 'building-heightmap';
+                this.type = 'custom';
+                this.renderingMode = '3d';
+            }
+            onAdd(map, gl) {
+                this.map = map;
+                const vertexSource = `
+                    #ifdef GL_FRAGMENT_PRECISION_HIGH
+                        precision highp float;
+                    #else
+                        precision mediump float;
+                    #endif
+
+                    uniform vec3 u_xyz;
+                    uniform vec2 u_dimensions;
+                    uniform float u_tile_size;
+                    attribute vec2 a_position;
+                    float PI = 3.141592653589793;
+                    varying vec2 vCoord;
+
+                        void main() {
+                            if (abs(a_position) == vec2(1,1)) {
+                                gl_Position = vec4(a_position, 0, 1);
+                                vCoord = a_position * 0.5 + 0.5;
+                                return;
+                            }
+                            float x = ((a_position.x + 180.0) / 360.0 * pow(2.0, u_xyz.z)) * u_tile_size - u_xyz.x;
+                            float y = (1.0 - (log(a_position.y) / PI)) / 2.0 * pow(2.0, u_xyz.z) * u_tile_size - u_xyz.y;
+                            vec2 transformed = vec2(x, y);
+                            vec2 normalized = transformed / u_dimensions;
+                            vec2 final = normalized * 2.0 - 1.0;
+                            gl_Position = vec4(final, 0, 1);
+                        }
+                `;
+
+                const fragmentSource = `
+                    #ifdef GL_FRAGMENT_PRECISION_HIGH
+                        precision highp float;
+                    #else
+                        precision mediump float;
+                    #endif
+
+                    uniform vec4 u_color;
+                    uniform sampler2D height_map;
+                    varying vec2 vCoord;
+
+                    void main() {
+                        gl_FragColor = u_color;
+                    }
+                `;
+
+                const vertexShader = gl.createShader(gl.VERTEX_SHADER);
+                gl.shaderSource(vertexShader, vertexSource);
+                gl.compileShader(vertexShader);
+                const fragmentShader = gl.createShader(gl.FRAGMENT_SHADER);
+                gl.shaderSource(fragmentShader, fragmentSource);
+                gl.compileShader(fragmentShader);
+                this.program = gl.createProgram();
+                gl.attachShader(this.program, vertexShader);
+                gl.attachShader(this.program, fragmentShader);
+                gl.linkProgram(this.program);
+                gl.validateProgram(this.program);
+                this.uXyz = gl.getUniformLocation(this.program, "u_xyz");
+                this.uDimensions = gl.getUniformLocation(this.program, "u_dimensions");
+                this.uColor = gl.getUniformLocation(this.program, "u_color");
+                this.uTileSize = gl.getUniformLocation(this.program, "u_tile_size");
+                this.aPosition = gl.getAttribLocation(this.program, "a_position");
+                this.targetTexture = gl.createTexture();
+                this.positionBuffer = gl.createBuffer();
+                this.indexBuffer = gl.createBuffer();
+                this.currentTiles = "";
+
+                this.fb = gl.createFramebuffer();
+                this.attachmentPoint = gl.COLOR_ATTACHMENT0
+            }
+            render(gl, matrix) {
+                console.log('render heightmap')
+
+                gl.useProgram(this.program);
+                const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+                if (status !== gl.FRAMEBUFFER_COMPLETE) {
+                    return;
+                }
+
+                const source = this.map.style._sourceCaches['other:composite'];
+                const coords = source.getVisibleCoordinates().reverse();
+                const buildingsLayer = map.getLayer('3d-buildings');
+                const context = this.map.painter.context;
+
+                if (coords.length === 0) {
+                    return;
+                }
+
+                // TODO: Consolidate this code between layers
+                let maxZoom = 0;
+                for (const coord of coords) {
+                    const { z } = source.getTile(coord).tileID.canonical;
+                    maxZoom = Math.max(maxZoom, z);
+                }
+                // find all tiles that are loaded
+                const tileDimensions = { xStart: Number.MAX_SAFE_INTEGER, yStart: Number.MAX_SAFE_INTEGER, xEnd: 0, yEnd: 0 };
+                let tileSize = 0;
+                let tilesWidth, tilesHeight;
+                for (const coord of coords) {
+                    const tile = source.getTile(coord);
+                    // console.log(tile);
+                    const { x, y, z } = tile.tileID.canonical;
+                    if (z !== maxZoom) {
+                        continue;
+                    }
+                    // console.log({ x, y, z })
+                    tileDimensions.xStart = Math.min(x, tileDimensions.xStart);
+                    tileDimensions.yStart = Math.min(y, tileDimensions.yStart);
+                    tileDimensions.xEnd = Math.max(x, tileDimensions.xEnd);
+                    tileDimensions.yEnd = Math.max(y, tileDimensions.yEnd);
+                    tileDimensions.zoom = z;
+                    tileDimensions.tileSize = TILE_SIZE;// tile.tileSize;
+                    const { xEnd, xStart, yEnd, yStart } = tileDimensions;
+                    tilesWidth = xEnd - xStart + 1;
+                    tilesHeight = yEnd - yStart + 1;
+                }
+                // END TODO: Consolidate this code between layers
+
+                gl.activeTexture(gl.TEXTURE0);
+                gl.bindTexture(gl.TEXTURE_2D, this.targetTexture);
+
+                if (JSON.stringify(tileDimensions) === this.currentTiles && refreshHeightmap === false) {
+                    // Texture already generated for these tiles, no need to regenerate
+                    return;
+                }
+                console.log('new buildings')
+                this.currentTiles = JSON.stringify(tileDimensions);
+
+                const width = tilesWidth * tileDimensions.tileSize;
+                const height = tilesHeight * tileDimensions.tileSize
+                const textureWidth = width;
+                const textureHeight = height;
+
+                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, textureWidth, textureHeight, 0, gl.RGBA, gl.UNSIGNED_BYTE, null); // TODO: flatten heightMap array
+
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+                gl.viewport(0, 0, textureWidth, textureHeight);
+                gl.bindFramebuffer(gl.FRAMEBUFFER, this.fb);
+                gl.framebufferTexture2D(gl.FRAMEBUFFER, this.attachmentPoint, gl.TEXTURE_2D, this.targetTexture, 0);
+
+                gl.bindBuffer(gl.ARRAY_BUFFER, this.positionBuffer);
+                gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.indexBuffer);
+
+                gl.clearColor(0, 0, 0, 0);
+                gl.clear(gl.COLOR_BUFFER_BIT);
+
+                const startX = tileDimensions.xStart * tileDimensions.tileSize;
+                const startY = tileDimensions.yStart * tileDimensions.tileSize;
+                gl.uniform3f(this.uXyz, startX, startY, tileDimensions.zoom);
+                gl.uniform2f(this.uDimensions, width, height);
+                gl.uniform1f(this.uTileSize, tileDimensions.tileSize);
+
+                const quad = new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]);
+                gl.enableVertexAttribArray(this.aPosition);
+                gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW);
+                gl.vertexAttribPointer(this.aPosition, 2, gl.FLOAT, false, 0, 0);
+
+                gl.uniform4f(this.uColor, 0, 0, 0, 0);
+                gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+                normalizedBuildings.forEach((feature) => {
+                    const { buildingHeight, aPosition, cuts, centroid, highlight } = feature;
+
+                    const scaledBuildingHeight = buildingHeight * heightScaler;
+                    const topHex = Math.floor(scaledBuildingHeight / 256) / 256;
+                    const bottomHex = Math.floor(scaledBuildingHeight % 256) / 256;
+
+                    maxHeight = Math.max(maxHeight, scaledBuildingHeight / heightScaler);
+
+                    gl.uniform4f(this.uColor, topHex, bottomHex, highlight ? 1.0 : 0, 1);
+
+                    gl.bufferData(gl.ARRAY_BUFFER, aPosition, gl.DYNAMIC_DRAW);
+                    gl.vertexAttribPointer(this.aPosition, 2, gl.FLOAT, false, 0, 0);
+
+                    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, cuts, gl.DYNAMIC_DRAW);
+
+                    gl.drawElements(gl.TRIANGLES, cuts.length, cuts.length > 256 ? gl.UNSIGNED_SHORT : gl.UNSIGNED_BYTE, 0);
+                });
+
+                gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+                refreshHeightmap = false;
+            }
+        }
+
+        map.on('style.load', () => {
+            // Insert the layer beneath any symbol layer.
+            const layers = map.getStyle().layers;
+            const labelLayerId = layers.find(
+                (layer) => layer.type === 'symbol' && layer.layout['text-field']
+            ).id;
+
+            map.addLayer(
+                {
+                    'id': '3d-buildings',
+                    'source': 'composite',
+                    'source-layer': 'building',
+                    'filter': ['all', ['==', 'extrude', 'true'], ['==', 'underground', 'false']],
+                    'type': 'fill-extrusion',
+                    'minzoom': 14,
+                    'paint': {
+                        'fill-extrusion-color': '#aaa',
+                        'fill-extrusion-height': ['get', 'height'],
+                        'fill-extrusion-base': ['get', 'min_height'],
+                        'fill-extrusion-opacity': 1
+                    }
+                },
+                labelLayerId
+            );
+            const buildingHeightMap = new BuildingHeightMap();
+            map.addLayer(buildingHeightMap);
+            const buildingShadows = new BuildingShadows();
+            map.addLayer(buildingShadows);
+
+            map.once('idle', loadBuildings);
+            map.on('moveend', loadBuildings);
+        });
+
+        function loadBuildings() {
+            const features = map.querySourceFeatures("composite", { sourceLayer: "building" }) //.filter((val, i) => val.id === rendered[0].id)
+                .filter((feature) => {
+                    return (
+                        feature.properties &&
+                        feature.properties.underground !== "true" &&
+                        feature.properties.extrude === "true" &&
+                        (feature.properties.height || feature.properties.render_height)
+                    );
+                });
+
+            // sort buildings by height so we don't paint shorter segments over taller ones
+            features.sort((a, b) => {
+                return (a.properties).height - (b.properties).height;
+            });
+            normalizedBuildings = normalizeBuildings(features);
+            refreshHeightmap = true;
+            map.triggerRepaint();
+        }
+
+        function normalizeBuildings(features) {
+            const multiPolygons = features.filter((feature) => feature.geometry.type === "MultiPolygon");
+            multiPolygons.forEach((feature) => {
+                const { geometry, properties, type } = feature;
+                if (geometry.type !== "MultiPolygon") {
+                    return;
+                }
+                for (let i = 0; i < geometry.coordinates.length; i++) {
+                    features.push({
+                        ...feature,
+                        geometry: { ...geometry, type: "Polygon", coordinates: geometry.coordinates[i] },
+                    });
+                }
+            });
+
+            const normalized = features
+                .filter((feature) => feature.geometry.type === "Polygon")
+                .map((feature) => {
+                    const { geometry, properties } = feature;
+                    const { vertices: flatCoords } = earcut.flatten((geometry).coordinates);
+                    const aPosition = new Float32Array(
+                        flatCoords.map((coord, i) => {
+                            if (i % 2 === 1) {
+                                //lat
+                                const radians = (coord * Math.PI) / 180;
+                                // WebGL tan/cos function gives different result in Safari than FF/Chrome
+                                return Math.tan(radians) + 1 / Math.cos(radians);
+                            }
+                            return coord;
+                        })
+                    );
+                    const earcuts = earcut(flatCoords);
+                    // make sure vertex array is smallest sufficient possible
+                    const cuts = earcuts.length > 256 ? new Uint16Array(earcuts) : new Uint8Array(earcuts);
+                    const buildingHeight = getBuildingHeight(properties);
+                    const highlight = properties.highlight || false;
+
+                    let xSum = 0;
+                    let ySum = 0;
+                    let len = 0;
+
+                    for (let i = 0; i < flatCoords.length; i += 2) {
+                        xSum += flatCoords[i];
+                        ySum += flatCoords[i + 1];
+                        len++;
+                    }
+                    const centroid = [xSum / len, ySum / len];
+
+                    return {
+                        aPosition,
+                        cuts,
+                        buildingHeight,
+                        centroid,
+                        highlight,
+                    };
+                });
+            return normalized;
+        }
+
+        function getBuildingHeight(properties) {
+            // render_height used by Maptiler, height/(levels?) used by Mapbox
+            const { height = 0, levels = 0, render_height = 0 } = properties;
+            if (levels) {
+                return levels * 3.04;
+            }
+            return Math.max(height, render_height);
+        }
+
+        function getMetersPerPixel(latitude, zoom) {
+            const metersPerWorldUnit = (40075016.686 * Math.cos(latitude * Math.PI / 180)) / TILE_SIZE;
+            const metersPerPixel = metersPerWorldUnit / Math.pow(2, zoom);
+            return metersPerPixel;
+        }
+
+    </script>
+
+</body>
+
+</html>
